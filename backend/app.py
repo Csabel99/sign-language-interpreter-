@@ -1,399 +1,262 @@
 import asyncio
-import cv2
 import os
-import mediapipe as mp
 import time
 
 from dotenv import load_dotenv
+
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect
+)
+
 from google import genai
 from google.genai import types
 
 
 # ============================================================
-# MediaPipe setup
-# ============================================================
-
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
-
-
-# ============================================================
-# Gemini setup
+# Setup
 # ============================================================
 
 load_dotenv()
 
-api_key = os.getenv("GEMINI_API_KEY")
+API_KEY = os.getenv(
+    "GEMINI_API_KEY"
+)
 
-if not api_key:
-    raise RuntimeError("GEMINI_API_KEY not found")
+if not API_KEY:
+    raise RuntimeError(
+        "GEMINI_API_KEY not found"
+    )
 
-client = genai.Client(api_key=api_key)
 
-MODEL = "gemini-3.1-flash-live-preview"
+client = genai.Client(
+    api_key=API_KEY
+)
+
+MODEL = (
+    "gemini-3.1-flash-live-preview"
+)
+
+
+app = FastAPI()
 
 
 # ============================================================
-# Camera + MediaPipe
+# ASL instruction
 # ============================================================
 
-async def send_camera(session):
+ASL_PROMPT = """
+You are an American Sign Language (ASL)
+interpretation system.
 
-    # More stable webcam backend for Windows
-    camera = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+Analyze the recent video frames sent to you.
 
-    if not camera.isOpened():
-        raise RuntimeError("Could not open camera")
-
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    last_send_time = 0
-
-    # Create MediaPipe hand tracker
-    with mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=2,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    ) as hands:
-
-        try:
-
-            while True:
-
-                success, frame = camera.read()
-
-                if not success:
-                    print("Failed to read camera frame")
-                    await asyncio.sleep(0.05)
-                    continue
-
-
-                # ====================================================
-                # Mirror camera
-                # ====================================================
-
-                frame = cv2.flip(frame, 1)
-
-
-                # ====================================================
-                # Convert BGR -> RGB for MediaPipe
-                # ====================================================
-
-                rgb_frame = cv2.cvtColor(
-                    frame,
-                    cv2.COLOR_BGR2RGB
-                )
-
-                # Helps performance slightly
-                rgb_frame.flags.writeable = False
-
-                results = hands.process(rgb_frame)
-
-                rgb_frame.flags.writeable = True
-
-
-                # ====================================================
-                # Did MediaPipe find any hands?
-                # ====================================================
-
-                hand_detected = (
-                    results.multi_hand_landmarks is not None
-                )
-
-
-                # ====================================================
-                # Draw MediaPipe landmarks
-                # ====================================================
-
-                display_frame = frame.copy()
-
-                if hand_detected:
-
-                    for hand_landmarks in results.multi_hand_landmarks:
-
-                        mp_drawing.draw_landmarks(
-                            display_frame,
-                            hand_landmarks,
-                            mp_hands.HAND_CONNECTIONS,
-
-                            mp_drawing_styles
-                            .get_default_hand_landmarks_style(),
-
-                            mp_drawing_styles
-                            .get_default_hand_connections_style()
-                        )
-
-
-                    # Display status
-                    cv2.putText(
-                        display_frame,
-                        f"Hands detected: {len(results.multi_hand_landmarks)}",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 255, 0),
-                        2
-                    )
-
-                else:
-
-                    cv2.putText(
-                        display_frame,
-                        "No hands detected",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 0, 255),
-                        2
-                    )
-
-
-                # ====================================================
-                # Show camera + hand tracking
-                # ====================================================
-
-                cv2.imshow(
-                    "ASL Hand Tracking",
-                    display_frame
-                )
-
-                key = cv2.waitKey(1) & 0xFF
-
-                if key == ord("q"):
-                    print("Stopping camera...")
-                    break
-
-
-                # ====================================================
-                # Send frame to Gemini
-                # ====================================================
-
-                current_time = time.monotonic()
-
-                # Only send when:
-                #
-                # 1. MediaPipe sees a hand
-                # 2. At least one second passed
-                #
-                if (
-                    hand_detected
-                    and current_time - last_send_time >= 1
-                ):
-
-                    # Send ORIGINAL image to Gemini rather than
-                    # landmark overlay so Gemini can see the hand
-                    # naturally.
-
-                    success, encoded_frame = cv2.imencode(
-                        ".jpg",
-                        frame,
-                        [cv2.IMWRITE_JPEG_QUALITY, 70]
-                    )
-
-                    if success:
-
-                        jpeg_bytes = encoded_frame.tobytes()
-
-                        try:
-
-                            await session.send_realtime_input(
-                                video=types.Blob(
-                                    data=jpeg_bytes,
-                                    mime_type="image/jpeg"
-                                )
-                            )
-
-                            print(
-                                "Hand detected -> frame sent to Gemini"
-                            )
-
-                        except Exception as e:
-
-                            print(
-                                "Gemini frame error:",
-                                e
-                            )
-
-                            break
-
-                    last_send_time = current_time
-
-
-                # Allow other asyncio tasks to execute
-                await asyncio.sleep(0.01)
-
-
-        except asyncio.CancelledError:
-
-            print("Camera task cancelled")
-            raise
-
-
-        except Exception as e:
-
-            print("Camera error:")
-            print(type(e).__name__, e)
-
-
-        finally:
-
-            camera.release()
-
-            cv2.destroyAllWindows()
-
-            print("Camera released")
-
-
-# ============================================================
-# Gemini ASL prompt
-# ============================================================
-
-async def ask_gemini(session):
-
-    asl_prompt = """
-You are an American Sign Language (ASL) interpretation system.
-
-The camera frames provided to you contain a person whose hands
-have already been detected by a hand-tracking system.
-
-Your only task is to recognize valid American Sign Language
-and translate it into natural English.
+Your ONLY job is to recognize valid American
+Sign Language and translate it into natural English.
 
 Pay attention to:
 
-- Hand shape
-- Finger positions
-- Palm orientation
-- Hand location
-- Hand movement
-- Movement direction
-- Whether one or two hands are being used
-- The sequence of signs across recent video frames
-- Facial expression only when necessary for ASL meaning
+- hand shape
+- finger positions
+- palm orientation
+- hand location
+- hand movement
+- movement direction
+- whether one or two hands are being used
+- the sequence of movements across recent frames
+- facial expressions only when needed for ASL meaning
 
 Rules:
 
 - Only interpret American Sign Language.
-- Ignore ordinary hand movements that are not ASL.
+- Ignore random or ordinary hand gestures.
 - Ignore the background.
-- Ignore clothing and unrelated objects.
+- Do not describe the scene.
 - Do not describe the person's hands.
-- Do not describe what is happening in the scene.
 - Do not explain your reasoning.
 - Do not guess.
-- Do not interpret random gestures as ASL.
-- Consider recent frames together because ASL signs may involve movement.
-- If multiple signs form a phrase, translate the complete phrase.
-- Do not repeat a translation unless a new sign has been performed.
+- Consider multiple recent frames together.
+- Do not repeat the previous translation unless
+  a new sign has actually been performed.
 
-If you confidently recognize an ASL sign:
+If you confidently recognize a sign or phrase,
+return ONLY its natural English translation.
 
-Return ONLY its natural English translation.
-
-Example:
+Examples:
 
 Hello
 
-or:
-
 Thank you
 
-or:
+I love you
 
 How are you?
 
-If the sign cannot be confidently recognized,
-do not provide a translation.
+If there is no recognizable ASL sign,
+do not produce a translation.
 """
 
-    try:
 
-        while True:
+# ============================================================
+# Receive camera frames from React
+# ============================================================
 
-            # Give Gemini several frames to look at
-            await asyncio.sleep(4)
+async def receive_frames(
+    websocket: WebSocket,
+    session
+):
 
-            await session.send_realtime_input(
-                text=asl_prompt
+    last_gemini_frame = 0.0
+
+    while True:
+
+        # JPEG sent from React
+        frame_bytes = (
+            await websocket.receive_bytes()
+        )
+
+        current_time = time.monotonic()
+
+
+        # React sends ~5 FPS.
+        #
+        # Only forward approximately
+        # one frame/sec to Gemini.
+        if (
+            current_time -
+            last_gemini_frame
+            < 1.0
+        ):
+            continue
+
+
+        await session.send_realtime_input(
+            video=types.Blob(
+                data=frame_bytes,
+                mime_type="image/jpeg"
+            )
+        )
+
+
+        last_gemini_frame = current_time
+
+        print(
+            "Frame sent to Gemini"
+        )
+
+
+# ============================================================
+# Periodically ask Gemini for interpretation
+# ============================================================
+
+async def analyze_signs(session):
+
+    while True:
+
+        # Allow several frames to accumulate
+        await asyncio.sleep(4)
+
+        print(
+            "Asking Gemini to interpret ASL..."
+        )
+
+        await session.send_realtime_input(
+            text=ASL_PROMPT
+        )
+
+
+# ============================================================
+# Receive Gemini's translation
+# ============================================================
+
+async def receive_gemini(
+    session,
+    websocket: WebSocket
+):
+
+    previous_translation = None
+
+
+    while True:
+
+        async for response in session.receive():
+
+            if not response.server_content:
+                continue
+
+
+            transcription = (
+                response
+                .server_content
+                .output_transcription
             )
 
-            print("Gemini analyzing ASL...")
+
+            if not transcription:
+                continue
 
 
-    except asyncio.CancelledError:
+            text = transcription.text
 
-        raise
-
-
-    except Exception as e:
-
-        print("Gemini prompt error:")
-        print(type(e).__name__, e)
+            if not text:
+                continue
 
 
-# ============================================================
-# Receive Gemini output
-# ============================================================
+            text = text.strip()
 
-async def receive_responses(session):
-
-    try:
-
-        while True:
-
-            async for response in session.receive():
-
-                if not response.server_content:
-                    continue
-
-                transcription = (
-                    response
-                    .server_content
-                    .output_transcription
-                )
-
-                if not transcription:
-                    continue
-
-                text = transcription.text
-
-                if not text:
-                    continue
-
-                text = text.strip()
-
-                if text:
-
-                    print(
-                        "\nASL Translation:",
-                        text
-                    )
+            if not text:
+                continue
 
 
-    except asyncio.CancelledError:
+            # Avoid sending same response repeatedly
+            if text == previous_translation:
+                continue
 
-        raise
+
+            previous_translation = text
 
 
-    except Exception as e:
+            print(
+                "ASL Translation:",
+                text
+            )
 
-        print("Gemini receive error:")
-        print(type(e).__name__, e)
+
+            # Send translation back to React
+            await websocket.send_text(
+                text
+            )
 
 
 # ============================================================
-# Main
+# React WebSocket
 # ============================================================
 
-async def main():
+@app.websocket("/ws/video")
+async def video_websocket(
+    websocket: WebSocket
+):
+
+    await websocket.accept()
+
+    print(
+        "React camera connected"
+    )
+
 
     config = {
-        "response_modalities": ["AUDIO"],
+        "response_modalities": [
+            "AUDIO"
+        ],
         "output_audio_transcription": {},
     }
+
+
+    frame_task = None
+    analysis_task = None
+    response_task = None
+
 
     try:
 
@@ -402,51 +265,105 @@ async def main():
             config=config
         ) as session:
 
-            print("Gemini connected.")
-            print("Starting MediaPipe hand tracking...")
-            print("Press Q to quit.\n")
-
-
-            camera_task = asyncio.create_task(
-                send_camera(session)
-            )
-
-            ask_task = asyncio.create_task(
-                ask_gemini(session)
-            )
-
-            receive_task = asyncio.create_task(
-                receive_responses(session)
+            print(
+                "Gemini Live connected"
             )
 
 
-            try:
-
-                await camera_task
-
-
-            finally:
-
-                ask_task.cancel()
-                receive_task.cancel()
-
-                await asyncio.gather(
-                    ask_task,
-                    receive_task,
-                    return_exceptions=True
+            frame_task = asyncio.create_task(
+                receive_frames(
+                    websocket,
+                    session
                 )
+            )
 
 
-    except Exception as e:
+            analysis_task = asyncio.create_task(
+                analyze_signs(
+                    session
+                )
+            )
 
-        print("Gemini connection error:")
-        print(type(e).__name__, e)
+
+            response_task = asyncio.create_task(
+                receive_gemini(
+                    session,
+                    websocket
+                )
+            )
 
 
-# ============================================================
-# Start program
-# ============================================================
+            tasks = {
+                frame_task,
+                analysis_task,
+                response_task
+            }
 
-if __name__ == "__main__":
-    asyncio.run(main())
-    
+
+            # If React disconnects or any major
+            # task exits, stop the others too.
+            done, pending = (
+                await asyncio.wait(
+                    tasks,
+                    return_when=
+                    asyncio.FIRST_COMPLETED
+                )
+            )
+
+
+            for task in pending:
+                task.cancel()
+
+
+            await asyncio.gather(
+                *pending,
+                return_exceptions=True
+            )
+
+
+            # Surface unexpected exceptions
+            for task in done:
+
+                if task.cancelled():
+                    continue
+
+                exception = task.exception()
+
+                if exception:
+                    raise exception
+
+
+    except WebSocketDisconnect:
+
+        print(
+            "React camera disconnected"
+        )
+
+
+    except Exception as error:
+
+        print(
+            "Backend error:"
+        )
+
+        print(
+            type(error).__name__,
+            error
+        )
+
+
+    finally:
+
+        for task in (
+            frame_task,
+            analysis_task,
+            response_task
+        ):
+
+            if task and not task.done():
+                task.cancel()
+
+
+        print(
+            "Gemini session closed"
+        )
