@@ -15,5 +15,6 @@ SignGuide is a web platform focused on bridging the gap between accessibility an
 - Python
 - React + Vite
 - Tailwind CSS
+- FastAPI
 
 **Product is still in development stage, translation may not be accurate**
